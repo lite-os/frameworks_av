@@ -59,6 +59,9 @@ CameraClient::CameraClient(const sp<CameraService>& cameraService,
     mOrientation = getOrientation(0, mCameraFacing == CAMERA_FACING_FRONT);
     mLegacyMode = legacyMode;
     mPlayShutterSound = true;
+
+    mLongshotEnabled = false;
+    mBurstCnt = 0;
     LOG1("CameraClient::CameraClient X (pid %d, id %d)", callingPid, cameraId);
 }
 
@@ -504,7 +507,7 @@ void CameraClient::releaseRecordingFrame(const sp<IMemory>& mem) {
 
 void CameraClient::releaseRecordingFrameHandle(native_handle_t *handle) {
     if (handle == nullptr) return;
-
+    Mutex::Autolock lock(mLock);
     sp<IMemory> dataPtr;
     {
         Mutex::Autolock l(mAvailableCallbackBuffersLock);
@@ -528,17 +531,22 @@ void CameraClient::releaseRecordingFrameHandle(native_handle_t *handle) {
         return;
     }
 
-    VideoNativeHandleMetadata *metadata = (VideoNativeHandleMetadata*)(dataPtr->pointer());
-    metadata->eType = kMetadataBufferTypeNativeHandleSource;
-    metadata->pHandle = handle;
-
-    mHardware->releaseRecordingFrame(dataPtr);
+    if (mHardware != nullptr) {
+        VideoNativeHandleMetadata *metadata = (VideoNativeHandleMetadata*)(dataPtr->pointer());
+        metadata->eType = kMetadataBufferTypeNativeHandleSource;
+        metadata->pHandle = handle;
+        mHardware->releaseRecordingFrame(dataPtr);
+    }
 }
 
 void CameraClient::releaseRecordingFrameHandleBatch(const std::vector<native_handle_t*>& handles) {
+    Mutex::Autolock lock(mLock);
+    bool disconnected = (mHardware == nullptr);
     size_t n = handles.size();
     std::vector<sp<IMemory>> frames;
-    frames.reserve(n);
+    if (!disconnected) {
+        frames.reserve(n);
+    }
     bool error = false;
     for (auto& handle : handles) {
         sp<IMemory> dataPtr;
@@ -562,10 +570,12 @@ void CameraClient::releaseRecordingFrameHandleBatch(const std::vector<native_han
             break;
         }
 
-        VideoNativeHandleMetadata *metadata = (VideoNativeHandleMetadata*)(dataPtr->pointer());
-        metadata->eType = kMetadataBufferTypeNativeHandleSource;
-        metadata->pHandle = handle;
-        frames.push_back(dataPtr);
+        if (!disconnected) {
+            VideoNativeHandleMetadata *metadata = (VideoNativeHandleMetadata*)(dataPtr->pointer());
+            metadata->eType = kMetadataBufferTypeNativeHandleSource;
+            metadata->pHandle = handle;
+            frames.push_back(dataPtr);
+        }
     }
 
     if (error) {
@@ -573,7 +583,7 @@ void CameraClient::releaseRecordingFrameHandleBatch(const std::vector<native_han
             native_handle_close(handle);
             native_handle_delete(handle);
         }
-    } else {
+    } else if (!disconnected) {
         mHardware->releaseRecordingFrameBatch(frames);
     }
     return;
@@ -660,6 +670,10 @@ status_t CameraClient::takePicture(int msgType) {
                            CAMERA_MSG_COMPRESSED_IMAGE);
 
     enableMsgType(picMsgType);
+    mBurstCnt = mHardware->getParameters().getInt("num-snaps-per-shutter");
+    if(mBurstCnt <= 0)
+        mBurstCnt = 1;
+    LOG1("mBurstCnt = %d", mBurstCnt);
 
     return mHardware->takePicture();
 }
@@ -761,6 +775,20 @@ status_t CameraClient::sendCommand(int32_t cmd, int32_t arg1, int32_t arg2) {
     } else if (cmd == CAMERA_CMD_PING) {
         // If mHardware is 0, checkPidAndHardware will return error.
         return OK;
+    } else if (cmd == CAMERA_CMD_HISTOGRAM_ON) {
+        enableMsgType(CAMERA_MSG_STATS_DATA);
+    } else if (cmd == CAMERA_CMD_HISTOGRAM_OFF) {
+        disableMsgType(CAMERA_MSG_STATS_DATA);
+    } else if (cmd == CAMERA_CMD_METADATA_ON) {
+        enableMsgType(CAMERA_MSG_META_DATA);
+    } else if (cmd == CAMERA_CMD_METADATA_OFF) {
+        disableMsgType(CAMERA_MSG_META_DATA);
+    } else if ( cmd == CAMERA_CMD_LONGSHOT_ON ) {
+        mLongshotEnabled = true;
+    } else if ( cmd == CAMERA_CMD_LONGSHOT_OFF ) {
+        mLongshotEnabled = false;
+        disableMsgType(CAMERA_MSG_SHUTTER);
+        disableMsgType(CAMERA_MSG_COMPRESSED_IMAGE);
     }
 
     return mHardware->sendCommand(cmd, arg1, arg2);
@@ -956,7 +984,9 @@ void CameraClient::handleShutter(void) {
         c->notifyCallback(CAMERA_MSG_SHUTTER, 0, 0);
         if (!lockIfMessageWanted(CAMERA_MSG_SHUTTER)) return;
     }
-    disableMsgType(CAMERA_MSG_SHUTTER);
+    if ( !mLongshotEnabled ) {
+        disableMsgType(CAMERA_MSG_SHUTTER);
+    }
 
     // Shutters only happen in response to takePicture, so mark device as
     // idle now, until preview is restarted
@@ -1041,7 +1071,13 @@ void CameraClient::handleRawPicture(const sp<IMemory>& mem) {
 
 // picture callback - compressed picture ready
 void CameraClient::handleCompressedPicture(const sp<IMemory>& mem) {
-    disableMsgType(CAMERA_MSG_COMPRESSED_IMAGE);
+    if (mBurstCnt)
+        mBurstCnt--;
+
+    if (!mBurstCnt && !mLongshotEnabled) {
+        LOG1("handleCompressedPicture mBurstCnt = %d", mBurstCnt);
+        disableMsgType(CAMERA_MSG_COMPRESSED_IMAGE);
+    }
 
     sp<hardware::ICameraClient> c = mRemoteCallback;
     mLock.unlock();

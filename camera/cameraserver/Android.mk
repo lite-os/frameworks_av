@@ -14,6 +14,9 @@
 
 LOCAL_PATH:= $(call my-dir)
 
+ifeq ($(TARGET_HAS_LEGACY_CAMERA_HAL1),true)
+$(warning Target has integrated cameraserver into mediaserver. This is weakening security measures introduced in 7.0)
+else
 include $(CLEAR_VARS)
 
 LOCAL_SRC_FILES:= \
@@ -32,6 +35,12 @@ LOCAL_SHARED_LIBRARIES := \
 	android.hardware.camera.device@1.0 \
 	android.hardware.camera.device@3.2
 
+ifeq ($(TARGET_USES_QTI_CAMERA_DEVICE), true)
+LOCAL_CFLAGS += -DQTI_CAMERA_DEVICE
+LOCAL_SHARED_LIBRARIES += \
+	vendor.qti.hardware.camera.device@1.0
+endif
+
 LOCAL_MODULE:= cameraserver
 LOCAL_32_BIT_ONLY := true
 
@@ -40,3 +49,4 @@ LOCAL_CFLAGS += -Wall -Wextra -Werror -Wno-unused-parameter
 LOCAL_INIT_RC := cameraserver.rc
 
 include $(BUILD_EXECUTABLE)
+endif
